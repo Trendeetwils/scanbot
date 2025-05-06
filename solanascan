@@ -1,0 +1,226 @@
+import requests
+import json
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# ---------------- Configuration ---------------- #
+SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+MORALIS_API_KEY = "YOUR_MORALIS_API_KEY"  # Replace with your Moralis API key
+TELEGRAM_BOT_TOKEN = "8045393071:AAFm7No7_FYKhUnDQzeQhZEnTUODUgvBHQc"
+
+# Mapping of chain names to Moralis chain parameter (for EVM chains)
+CHAIN_MAPPING = {
+    "ethereum": "eth",
+    "arbitrum": "arbitrum",
+    "base": "base",
+    "polygon": "polygon",
+    "berachain": "berachain",
+    "abstract": "abstract",
+}
+
+# ---------------- Solana Functions ---------------- #
+def fetch_token_list():
+    """
+    Fetch the official Solana token list and build a mapping from mint address to token name.
+    """
+    url = "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json"
+    token_name_dict = {}
+    try:
+        response = requests.get(url)
+        data = response.json()
+        tokens = data.get("tokens", [])
+        for token in tokens:
+            mint = token.get("address")
+            name = token.get("name")
+            if mint and name:
+                token_name_dict[mint] = name
+    except Exception as e:
+        print("Error fetching token list:", e)
+    return token_name_dict
+
+SOLANA_TOKEN_NAME_DICT = fetch_token_list()
+
+def get_solana_balance(wallet_address):
+    """
+    Fetch the SOL balance and token accounts for the given Solana wallet address.
+    """
+    headers = {"Content-Type": "application/json"}
+    # Get SOL balance
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBalance",
+        "params": [wallet_address]
+    }
+    response = requests.post(SOLANA_RPC_URL, headers=headers, data=json.dumps(payload)).json()
+    if "result" in response:
+        sol_balance = response["result"]["value"] / 1e9  # Convert lamports to SOL
+    else:
+        return None, "Invalid wallet address or API error for Solana."
+    
+    # Get token balances
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenAccountsByOwner",
+        "params": [
+            wallet_address,
+            {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+            {"encoding": "jsonParsed"}
+        ]
+    }
+    response = requests.post(SOLANA_RPC_URL, headers=headers, data=json.dumps(payload)).json()
+    tokens = []
+    if "result" in response and "value" in response["result"]:
+        for token in response["result"]["value"]:
+            token_info = token["account"]["data"]["parsed"]["info"]
+            mint = token_info.get("mint")
+            amount_raw = int(token_info["tokenAmount"]["amount"])
+            decimals = token_info["tokenAmount"]["decimals"]
+            amount = amount_raw / (10 ** decimals)
+            token_name = SOLANA_TOKEN_NAME_DICT.get(mint, "Unknown")
+            tokens.append({
+                "mint": mint,
+                "name": token_name,
+                "amount": amount
+            })
+    return sol_balance, tokens
+
+# ---------------- EVM Functions using Moralis ---------------- #
+def get_evm_balance(wallet_address, chain):
+    """
+    Fetch the native balance and ERC20 token balances for an EVM chain using the Moralis API.
+    """
+    headers = {"X-API-Key": MORALIS_API_KEY}
+    # Get native balance
+    url_native = f"https://deep-index.moralis.io/api/v2/{wallet_address}/balance?chain={chain}"
+    r_native = requests.get(url_native, headers=headers).json()
+    if "balance" in r_native:
+        native_balance = float(r_native["balance"]) / (10 ** r_native.get("decimals", 18))
+    else:
+        native_balance = None
+
+    # Get token balances
+    url_tokens = f"https://deep-index.moralis.io/api/v2/{wallet_address}/erc20?chain={chain}"
+    r_tokens = requests.get(url_tokens, headers=headers).json()
+    tokens = []
+    if isinstance(r_tokens, list):
+        for token in r_tokens:
+            mint = token.get("token_address", "Unknown")
+            name = token.get("name", "Unknown")
+            symbol = token.get("symbol", "")
+            amount_raw = token.get("balance", "0")
+            decimals = token.get("decimals", 18)
+            try:
+                amount = float(amount_raw) / (10 ** int(decimals))
+            except Exception:
+                amount = 0
+            tokens.append({
+                "mint": mint,
+                "name": f"{name} ({symbol})",
+                "amount": amount
+            })
+    return native_balance, tokens
+
+# ---------------- Bitcoin Function ---------------- #
+def get_bitcoin_balance(wallet_address):
+    """
+    Fetch the Bitcoin balance for a given Bitcoin wallet address using Blockchain.info API.
+    (Bitcoin typically doesn't have token contracts.)
+    """
+    url = f"https://blockchain.info/q/addressbalance/{wallet_address}"
+    try:
+        r = requests.get(url)
+        if r.status_code == 200:
+            satoshis = int(r.text)
+            btc_balance = satoshis / 1e8
+            return btc_balance, []
+        else:
+            return None, "Error fetching Bitcoin balance."
+    except Exception as e:
+        return None, str(e)
+
+# ---------------- Dispatcher ---------------- #
+def get_wallet_data(chain, wallet_address):
+    """
+    Based on the chain provided, call the respective function to fetch wallet data.
+    """
+    chain = chain.lower()
+    if chain == "solana":
+        return get_solana_balance(wallet_address)
+    elif chain == "bitcoin":
+        return get_bitcoin_balance(wallet_address)
+    elif chain in CHAIN_MAPPING:
+        evm_chain = CHAIN_MAPPING[chain]
+        return get_evm_balance(wallet_address, evm_chain)
+    else:
+        return None, f"Chain '{chain}' is not supported."
+
+# ---------------- Telegram Bot Handlers ---------------- #
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    usage = (
+        "Usage: /track <chain> <wallet_address>\n"
+        "Supported chains: solana, ethereum, arbitrum, base, polygon, berachain, abstract, bitcoin"
+    )
+    await update.message.reply_text(usage)
+
+async def track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = update.message.text.split()
+    if len(args) != 3:
+        await update.message.reply_text("Incorrect format.\nUsage: /track <chain> <wallet_address>")
+        return
+    _, chain, wallet_address = args
+    result = get_wallet_data(chain, wallet_address)
+    if result is None or result[0] is None:
+        error_message = result[1] if result else "Error retrieving wallet data."
+        await update.message.reply_text(error_message)
+    else:
+        native_balance, tokens = result
+        # Build a styled response using a Unicode box design.
+        message = "<pre>\n"
+        if chain == "solana":
+            message += "╔══════════════════════════════╗\n"
+            message += f"║  SOL Balance: {native_balance:.4f} SOL       ║\n"
+        elif chain == "bitcoin":
+            message += "╔══════════════════════════════╗\n"
+            message += f"║  BTC Balance: {native_balance:.4f} BTC       ║\n"
+        else:
+            # For EVM chains, display the native balance with an appropriate symbol.
+            symbol = {
+                "eth": "ETH",
+                "arbitrum": "ETH",
+                "base": "ETH",
+                "polygon": "MATIC",
+                "berachain": "BERA",
+                "abstract": "ABS"
+            }.get(CHAIN_MAPPING.get(chain, "eth"), "TOKEN")
+            message += "╔══════════════════════════════╗\n"
+            message += f"║  Balance: {native_balance:.4f} {symbol}       ║\n"
+        message += "╟──────────────────────────────╢\n"
+        message += "║ Tokens Held:\n"
+        if tokens:
+            for token in tokens:
+                message += f"║  {token['name']} ({token['amount']})\n"
+                message += f"║    {token['mint']}\n"
+        else:
+            message += "║   No tokens found.\n"
+        message += "╚══════════════════════════════╝\n"
+        message += "</pre>\n"
+        message += '<i>Contact @trendiorr on <a href="https://x.com/trendiorr">X</a> for support</i>'
+        
+        await update.message.reply_text(message, parse_mode="HTML")
+
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("track", track))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
